@@ -15,7 +15,7 @@
           <input type="file" accept=".json,application/json" @change="onProjectImport" />
         </label>
         <button class="button primary" :disabled="!project" @click="saveCurrentProject">保存到本机</button>
-        <button class="button secondary" :disabled="!project" @click="downloadOriginalXml">导出原 XML</button>
+        <button class="button secondary" :disabled="!activeVersion" @click="downloadOriginalXml">导出当前版本 XML</button>
         <button class="button secondary" :disabled="!project" @click="downloadProjectBundle">导出工程包</button>
       </div>
     </header>
@@ -31,12 +31,32 @@
           </div>
         </section>
 
+        <section v-if="project" class="panel">
+          <h2>乐谱版本</h2>
+          <div class="version-list">
+            <button
+              v-for="version in project.versions"
+              :key="version.id"
+              :class="['version-row', { active: version.id === project.activeVersionId }]"
+              @click="switchVersion(version.id)"
+            >
+              <strong>{{ version.name }}</strong>
+              <small>{{ version.marks.length }} 标记 · {{ formatDate(version.createdAt) }}</small>
+            </button>
+          </div>
+          <label class="button secondary version-import">
+            导入新版 XML…
+            <input type="file" accept=".xml,.musicxml,application/xml,text/xml" @change="onVersionFileSelected" />
+          </label>
+          <p class="muted">新版本只保存自己的 XML 与标记，不会把旧标记按同名小节迁往新版。</p>
+        </section>
+
         <section class="panel">
           <h2>本机工程</h2>
           <div v-if="projects.length === 0" class="muted">IndexedDB 中还没有工程。</div>
           <div v-for="item in projects" :key="item.id" class="project-row">
             <button class="link-button" @click="loadStoredProject(item)">{{ item.name }}</button>
-            <small>{{ formatDate(item.updatedAt) }} · {{ item.marks.length }} 标记</small>
+            <small>{{ formatDate(item.updatedAt) }} · {{ item.versions.length }} 版本 · {{ totalMarks(item) }} 标记</small>
             <button class="danger" @click="removeStoredProject(item.id)">删除</button>
           </div>
         </section>
@@ -82,8 +102,8 @@
 
         <div class="score-wrap">
           <ScoreView
-            v-if="project && score && path"
-            :xml="project.originalXml"
+            v-if="project && activeVersion && score && path"
+            :xml="activeVersion.originalXml"
             :measures="score.measures"
             :path="path"
             :active-step-index="activeStepIndex"
@@ -139,14 +159,15 @@
         </section>
 
         <section class="panel">
-          <h2>排练标记（独立保存）</h2>
+          <h2>排练标记（按版本独立保存）</h2>
+          <p v-if="activeVersion" class="muted">当前版本：{{ activeVersion.name }}</p>
           <div class="mark-form">
             <input v-model="markLabel" placeholder="标记名，如 A2" />
             <textarea v-model="markComment" placeholder="排练说明，不写回 XML" />
-            <button class="button primary" :disabled="!project" @click="addMark">给当前到达位置加标记</button>
+            <button class="button primary" :disabled="!activeVersion" @click="addMark">给当前到达位置加标记</button>
           </div>
           <div class="mark-list">
-            <article v-for="mark in project?.marks ?? []" :key="mark.id">
+            <article v-for="mark in activeVersion?.marks ?? []" :key="mark.id">
               <strong>{{ mark.label }}</strong>
               <p>{{ mark.comment }}</p>
               <small>书面小节 {{ score?.measures[mark.measureIndex]?.number }} · 第 {{ mark.occurrence }} 次</small>
@@ -165,6 +186,46 @@
         </section>
       </aside>
     </main>
+
+    <div v-if="pendingVersion || pendingVersionError" class="preview-overlay">
+      <div class="preview-dialog panel">
+        <h2>导入为新版本 · 路径预览</h2>
+        <template v-if="pendingVersion">
+          <p class="muted">{{ pendingVersion.fileName }}</p>
+          <div :class="['status-badge', pendingVersion.path.closed ? 'ok' : 'bad']">
+            {{ pendingVersion.path.closed ? '路径可闭合' : '路径存在错误' }}
+          </div>
+          <div class="stat-grid">
+            <span>实际小节</span><strong>{{ pendingVersion.path.steps.length }}</strong>
+            <span>书面小节</span><strong>{{ pendingVersion.score.measures.length }}</strong>
+            <span>总时长</span><strong>{{ formatTime(pendingVersion.path.totalSeconds) }}</strong>
+          </div>
+          <div v-if="pendingVersion.path.warnings.length" class="preview-warnings">
+            <div v-for="(warning, index) in pendingVersion.path.warnings" :key="index" :class="['warning', warning.level]">
+              <strong>{{ warning.level === 'error' ? '错误' : warning.level === 'warning' ? '警告' : '信息' }}</strong>
+              <span>{{ warning.message }}</span>
+            </div>
+          </div>
+          <label class="version-name-field">
+            版本名称
+            <input v-model="pendingVersionName" />
+          </label>
+          <div class="preview-actions">
+            <button class="button primary" @click="confirmPendingVersion">确认保存为新版本</button>
+            <button class="button secondary" @click="cancelPendingVersion">取消</button>
+          </div>
+          <p class="muted">确认后旧版本的 XML 与排练标记保持原样，不会按同名小节迁移。</p>
+        </template>
+        <template v-else>
+          <p class="muted">{{ pendingVersionError?.fileName }}</p>
+          <div class="status-badge bad">XML 被拒绝，未写入任何版本</div>
+          <p class="preview-error">{{ pendingVersionError?.message }}</p>
+          <div class="preview-actions">
+            <button class="button secondary" @click="cancelPendingVersion">关闭（当前工程不受影响）</button>
+          </div>
+        </template>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -173,22 +234,32 @@ import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import ScoreView from './components/ScoreView.vue'
 import { buildBeatEvents, Metronome, type BeatEvent } from './audio/metronome'
 import {
+  activeVersionOf,
+  appendVersion,
   createProject,
   deleteProject,
   downloadText,
   exportProject,
   importProjectFile,
   listProjects,
+  normalizeProject,
   saveProject,
 } from './storage/projects'
 import { arrivalsFor, buildPerformancePath, formatTime, parseMusicXml, type ParsedScore } from './score/parser'
 import { sampleLibrary } from './score/samples'
-import type { RehearsalMark, StoredProject } from './score/types'
+import type { BuiltPath, RehearsalMark, StoredProject } from './score/types'
+
+interface PendingVersion {
+  fileName: string
+  xml: string
+  score: ParsedScore
+  path: BuiltPath
+}
 
 const projects = ref<StoredProject[]>([])
 const project = ref<StoredProject | null>(null)
 const score = ref<ParsedScore | null>(null)
-const path = ref<ReturnType<typeof buildPerformancePath> | null>(null)
+const path = ref<BuiltPath | null>(null)
 const selectedMeasureIndex = ref(0)
 const selectedOccurrence = ref(1)
 const activeStepIndex = ref<number | null>(null)
@@ -197,9 +268,13 @@ const playing = ref(false)
 const markLabel = ref('')
 const markComment = ref('')
 const beatEvents = ref<BeatEvent[]>([])
+const pendingVersion = ref<PendingVersion | null>(null)
+const pendingVersionError = ref<{ fileName: string; message: string } | null>(null)
+const pendingVersionName = ref('')
 let metronome: Metronome | null = null
 let rafHandle = 0
 
+const activeVersion = computed(() => project.value ? activeVersionOf(project.value) : null)
 const selectedMeasure = computed(() => score.value?.measures[selectedMeasureIndex.value] ?? null)
 const selectedOccurrences = computed(() => path.value ? arrivalsFor(path.value, selectedMeasureIndex.value) : [])
 const playProgress = computed(() => path.value && path.value.totalSeconds > 0 ? currentScoreTime.value / path.value.totalSeconds : 0)
@@ -241,8 +316,63 @@ async function onFileSelected(event: Event): Promise<void> {
 }
 
 function loadStoredProject(item: StoredProject): void {
-  project.value = JSON.parse(JSON.stringify(item)) as StoredProject
-  analyze(project.value.originalXml)
+  project.value = normalizeProject(JSON.parse(JSON.stringify(item)))
+  analyze(activeVersionOf(project.value).originalXml)
+}
+
+function switchVersion(versionId: string): void {
+  if (!project.value || project.value.activeVersionId === versionId) return
+  const version = project.value.versions.find((item) => item.id === versionId)
+  if (!version) return
+  project.value.activeVersionId = versionId
+  analyze(version.originalXml)
+}
+
+function totalMarks(item: StoredProject): number {
+  return item.versions.reduce((sum, version) => sum + version.marks.length, 0)
+}
+
+async function onVersionFileSelected(event: Event): Promise<void> {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file || !project.value) return
+  if (file.name.toLowerCase().endsWith('.mxl')) {
+    pendingVersionError.value = { fileName: file.name, message: '压缩 .mxl 尚未列入明确支持范围。请解压为 .musicxml/.xml 后导入。' }
+    return
+  }
+  const xml = await file.text()
+  try {
+    const parsed = parseMusicXml(xml)
+    pendingVersion.value = {
+      fileName: file.name,
+      xml,
+      score: parsed,
+      path: buildPerformancePath(parsed),
+    }
+    pendingVersionName.value = `版本 ${project.value.versions.length + 1}`
+    pendingVersionError.value = null
+  } catch (error) {
+    pendingVersion.value = null
+    pendingVersionError.value = {
+      fileName: file.name,
+      message: error instanceof Error ? error.message : String(error),
+    }
+  }
+}
+
+function confirmPendingVersion(): void {
+  if (!project.value || !pendingVersion.value) return
+  const name = pendingVersionName.value.trim() || `版本 ${project.value.versions.length + 1}`
+  const version = appendVersion(project.value, name, pendingVersion.value.xml)
+  pendingVersion.value = null
+  analyze(version.originalXml)
+  void saveCurrentProject()
+}
+
+function cancelPendingVersion(): void {
+  pendingVersion.value = null
+  pendingVersionError.value = null
 }
 
 async function saveCurrentProject(): Promise<void> {
@@ -274,8 +404,8 @@ async function onProjectImport(event: Event): Promise<void> {
 }
 
 function downloadOriginalXml(): void {
-  if (!project.value) return
-  downloadText(`${project.value.name}.musicxml`, project.value.originalXml, 'application/vnd.recordare.musicxml+xml')
+  if (!project.value || !activeVersion.value) return
+  downloadText(`${project.value.name}-${activeVersion.value.name}.musicxml`, activeVersion.value.originalXml, 'application/vnd.recordare.musicxml+xml')
 }
 
 function downloadProjectBundle(): void {
@@ -361,7 +491,8 @@ function arrivalDescription(occurrence: number): string {
 }
 
 function addMark(): void {
-  if (!project.value) return
+  const version = activeVersion.value
+  if (!version) return
   const mark: RehearsalMark = {
     id: crypto.randomUUID(),
     measureIndex: selectedMeasureIndex.value,
@@ -371,15 +502,16 @@ function addMark(): void {
     color: '#f4b942',
     createdAt: new Date().toISOString(),
   }
-  project.value.marks.push(mark)
+  version.marks.push(mark)
   markLabel.value = ''
   markComment.value = ''
   void saveCurrentProject()
 }
 
 function removeMark(id: string): void {
-  if (!project.value) return
-  project.value.marks = project.value.marks.filter((mark) => mark.id !== id)
+  const version = activeVersion.value
+  if (!version) return
+  version.marks = version.marks.filter((mark) => mark.id !== id)
   void saveCurrentProject()
 }
 

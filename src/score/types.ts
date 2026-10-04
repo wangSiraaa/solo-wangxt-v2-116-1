@@ -130,7 +130,25 @@ export interface RehearsalMark {
   createdAt: string
 }
 
+export interface ScoreVersion {
+  id: string
+  name: string
+  originalXml: string
+  marks: RehearsalMark[]
+  createdAt: string
+}
+
 export interface StoredProject {
+  id: string
+  name: string
+  versions: ScoreVersion[]
+  activeVersionId: string
+  updatedAt: string
+  createdAt: string
+}
+
+/** 多版本之前的单版本工程形状，仅用于打开旧数据时迁移。 */
+export interface LegacyStoredProject {
   id: string
   name: string
   originalXml: string
@@ -140,6 +158,12 @@ export interface StoredProject {
 }
 
 export interface ProjectExport {
-  format: 'local-rehearsal-project/v1'
+  format: 'local-rehearsal-project/v2'
+  exportedAt: string
   project: StoredProject
+}
+
+export interface LegacyProjectExport {
+  format: 'local-rehearsal-project/v1'
+  project: LegacyStoredProject
 }
