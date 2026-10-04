@@ -23,6 +23,32 @@
     <main class="workspace">
       <aside class="sidebar">
         <section class="panel">
+          <h2>乐谱版本</h2>
+          <div v-if="!project" class="muted">打开或导入工程后，可在此把新 XML 加为新版本。</div>
+          <template v-else>
+            <div class="version-list">
+              <button
+                v-for="version in project.versions"
+                :key="version.id"
+                :class="['version-row', { active: version.id === currentVersion?.id }]"
+                @click="switchVersion(version.id)"
+              >
+                <span class="version-head">
+                  <strong>{{ version.label }}</strong>
+                  <span v-if="version.id === currentVersion?.id" class="tag">当前</span>
+                </span>
+                <small>{{ formatDate(version.importedAt) }} · {{ version.marks.length }} 标记</small>
+              </button>
+            </div>
+            <label class="button secondary version-import">
+              导入新 XML 为新版本
+              <input type="file" accept=".xml,.musicxml,application/xml,text/xml" @change="onVersionFileSelected" />
+            </label>
+            <p class="muted hint">先解析并预览路径状态，确认后才保存；旧版本标记不会按同名小节迁移。</p>
+          </template>
+        </section>
+
+        <section class="panel">
           <h2>样例</h2>
           <div class="sample-list">
             <button v-for="sample in sampleLibrary" :key="sample.name" class="button sample" @click="loadSample(sample)">
@@ -36,7 +62,7 @@
           <div v-if="projects.length === 0" class="muted">IndexedDB 中还没有工程。</div>
           <div v-for="item in projects" :key="item.id" class="project-row">
             <button class="link-button" @click="loadStoredProject(item)">{{ item.name }}</button>
-            <small>{{ formatDate(item.updatedAt) }} · {{ item.marks.length }} 标记</small>
+            <small>{{ formatDate(item.updatedAt) }} · {{ item.versions.length }} 版本 · {{ totalMarks(item) }} 标记</small>
             <button class="danger" @click="removeStoredProject(item.id)">删除</button>
           </div>
         </section>
@@ -82,8 +108,9 @@
 
         <div class="score-wrap">
           <ScoreView
-            v-if="project && score && path"
-            :xml="project.originalXml"
+            v-if="project && currentVersion && score && path"
+            :key="currentVersion.id"
+            :xml="currentVersion.originalXml"
             :measures="score.measures"
             :path="path"
             :active-step-index="activeStepIndex"
@@ -139,14 +166,14 @@
         </section>
 
         <section class="panel">
-          <h2>排练标记（独立保存）</h2>
+          <h2>排练标记（{{ currentVersion?.label ?? '' }} · 独立保存）</h2>
           <div class="mark-form">
             <input v-model="markLabel" placeholder="标记名，如 A2" />
             <textarea v-model="markComment" placeholder="排练说明，不写回 XML" />
-            <button class="button primary" :disabled="!project" @click="addMark">给当前到达位置加标记</button>
+            <button class="button primary" :disabled="!currentVersion" @click="addMark">给当前到达位置加标记</button>
           </div>
           <div class="mark-list">
-            <article v-for="mark in project?.marks ?? []" :key="mark.id">
+            <article v-for="mark in currentVersion?.marks ?? []" :key="mark.id">
               <strong>{{ mark.label }}</strong>
               <p>{{ mark.comment }}</p>
               <small>书面小节 {{ score?.measures[mark.measureIndex]?.number }} · 第 {{ mark.occurrence }} 次</small>
@@ -165,25 +192,36 @@
         </section>
       </aside>
     </main>
+
+    <VersionImportDialog
+      :preview="versionImport"
+      :project-name="project?.name ?? ''"
+      :version-count="project?.versions.length ?? 0"
+      @cancel="cancelVersionImport"
+      @confirm="confirmVersionImport"
+    />
   </div>
 </template>
 
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import ScoreView from './components/ScoreView.vue'
+import VersionImportDialog, { type VersionImportPreview } from './components/VersionImportDialog.vue'
 import { buildBeatEvents, Metronome, type BeatEvent } from './audio/metronome'
 import {
+  addProjectVersion,
   createProject,
   deleteProject,
   downloadText,
   exportProject,
   importProjectFile,
   listProjects,
+  normalizeProject,
   saveProject,
 } from './storage/projects'
 import { arrivalsFor, buildPerformancePath, formatTime, parseMusicXml, type ParsedScore } from './score/parser'
 import { sampleLibrary } from './score/samples'
-import type { RehearsalMark, StoredProject } from './score/types'
+import type { RehearsalMark, ScoreVersion, StoredProject } from './score/types'
 
 const projects = ref<StoredProject[]>([])
 const project = ref<StoredProject | null>(null)
@@ -197,9 +235,13 @@ const playing = ref(false)
 const markLabel = ref('')
 const markComment = ref('')
 const beatEvents = ref<BeatEvent[]>([])
+const versionImport = ref<VersionImportPreview | null>(null)
 let metronome: Metronome | null = null
 let rafHandle = 0
 
+const currentVersion = computed<ScoreVersion | null>(
+  () => project.value?.versions.find((version) => version.id === project.value?.currentVersionId) ?? project.value?.versions[0] ?? null,
+)
 const selectedMeasure = computed(() => score.value?.measures[selectedMeasureIndex.value] ?? null)
 const selectedOccurrences = computed(() => path.value ? arrivalsFor(path.value, selectedMeasureIndex.value) : [])
 const playProgress = computed(() => path.value && path.value.totalSeconds > 0 ? currentScoreTime.value / path.value.totalSeconds : 0)
@@ -208,20 +250,47 @@ async function refreshProjectList(): Promise<void> {
   projects.value = await listProjects()
 }
 
-function analyze(xml: string): void {
-  const parsed = parseMusicXml(xml)
+function totalMarks(item: StoredProject): number {
+  return item.versions.reduce((sum, version) => sum + version.marks.length, 0)
+}
+
+/** 把一次已解析的乐谱分析应用到界面状态。调用方负责先解析成功再调用。 */
+function applyAnalysis(parsed: ParsedScore): void {
+  const built = buildPerformancePath(parsed)
   score.value = parsed
-  path.value = buildPerformancePath(parsed)
-  beatEvents.value = buildBeatEvents(path.value.steps, parsed.measures)
+  path.value = built
+  beatEvents.value = buildBeatEvents(built.steps, parsed.measures)
   selectedMeasureIndex.value = 0
-  selectedOccurrence.value = path.value.arrivals[0]?.occurrences[0] ?? 1
+  selectedOccurrence.value = built.arrivals[0]?.occurrences[0] ?? 1
   stopPlayback()
 }
 
+/** 切换到同一工程中的另一个版本：只重新解析该版本自己的 XML，标记原样保留在各自版本里。 */
+function switchVersion(versionId: string): void {
+  if (!project.value || versionId === project.value.currentVersionId) return
+  const target = project.value.versions.find((version) => version.id === versionId)
+  if (!target) return
+  let parsed: ParsedScore
+  try {
+    parsed = parseMusicXml(target.originalXml)
+  } catch (error) {
+    window.alert(`版本「${target.label}」的 XML 无法解析，已保持在当前版本：\n${error instanceof Error ? error.message : String(error)}`)
+    return
+  }
+  project.value.currentVersionId = target.id
+  applyAnalysis(parsed)
+  void saveCurrentProject()
+}
+
 function loadXml(name: string, xml: string): void {
-  project.value = createProject(name, xml)
-  analyze(xml)
-  void refreshProjectList()
+  try {
+    const parsed = parseMusicXml(xml)
+    project.value = createProject(name, xml)
+    applyAnalysis(parsed)
+    void refreshProjectList()
+  } catch (error) {
+    window.alert(error instanceof Error ? error.message : 'MusicXML 无法解析，未打开任何工程。')
+  }
 }
 
 function loadSample(sample: { name: string; getXml: () => string }): void {
@@ -234,15 +303,72 @@ async function onFileSelected(event: Event): Promise<void> {
   if (!file) return
   if (file.name.toLowerCase().endsWith('.mxl')) {
     window.alert('压缩 .mxl 尚未列入明确支持范围。请解压为 .musicxml/.xml 后打开。')
+    input.value = ''
     return
   }
   loadXml(file.name.replace(/\.(musicxml|xml)$/i, ''), await file.text())
   input.value = ''
 }
 
+/** 导入新版本的第一步：只解析并预览，不动当前工程；XML 无效时直接被拒，工程照常使用。 */
+async function onVersionFileSelected(event: Event): Promise<void> {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file || !project.value) return
+  if (file.name.toLowerCase().endsWith('.mxl')) {
+    window.alert('压缩 .mxl 尚未列入明确支持范围。请解压为 .musicxml/.xml 后打开。')
+    return
+  }
+  const xml = await file.text()
+  let parsed: ParsedScore
+  try {
+    parsed = parseMusicXml(xml)
+  } catch (error) {
+    window.alert(`新 XML 被拒绝，当前工程未做任何改动：\n${error instanceof Error ? error.message : String(error)}`)
+    return
+  }
+  if (!parsed.measures.length) {
+    window.alert('新 XML 被拒绝：没有解析出任何小节，当前工程未做任何改动。')
+    return
+  }
+  versionImport.value = {
+    fileName: file.name.replace(/\.(musicxml|xml)$/i, ''),
+    xml,
+    score: parsed,
+    path: buildPerformancePath(parsed),
+  }
+}
+
+/** 第二步（确认后）：原样保存 XML 为新版本，标记从空开始，不做任何迁移。 */
+function confirmVersionImport(label: string, xml: string): void {
+  if (!project.value) return
+  const parsed = versionImport.value?.score ?? parseMusicXml(xml)
+  const added = addProjectVersion(project.value, label, xml)
+  versionImport.value = null
+  applyAnalysis(parsed)
+  project.value.currentVersionId = added.id
+  void saveCurrentProject()
+}
+
+function cancelVersionImport(): void {
+  versionImport.value = null
+}
+
 function loadStoredProject(item: StoredProject): void {
-  project.value = JSON.parse(JSON.stringify(item)) as StoredProject
-  analyze(project.value.originalXml)
+  // 再归一化一次，保证 IndexedDB 里的旧单版本记录也能以单版本工程打开。
+  const loaded = normalizeProject(JSON.parse(JSON.stringify(item)))
+  const first = loaded.versions.find((version) => version.id === loaded.currentVersionId) ?? loaded.versions[0]
+  let parsed: ParsedScore
+  try {
+    parsed = parseMusicXml(first.originalXml)
+  } catch (error) {
+    window.alert(`工程「${loaded.name}」当前版本的 XML 无法解析：\n${error instanceof Error ? error.message : String(error)}`)
+    return
+  }
+  project.value = loaded
+  loaded.currentVersionId = first.id
+  applyAnalysis(parsed)
 }
 
 async function saveCurrentProject(): Promise<void> {
@@ -274,8 +400,12 @@ async function onProjectImport(event: Event): Promise<void> {
 }
 
 function downloadOriginalXml(): void {
-  if (!project.value) return
-  downloadText(`${project.value.name}.musicxml`, project.value.originalXml, 'application/vnd.recordare.musicxml+xml')
+  if (!currentVersion.value) return
+  downloadText(
+    `${project.value?.name ?? 'score'}-${currentVersion.value.label}.musicxml`,
+    currentVersion.value.originalXml,
+    'application/vnd.recordare.musicxml+xml',
+  )
 }
 
 function downloadProjectBundle(): void {
@@ -361,7 +491,7 @@ function arrivalDescription(occurrence: number): string {
 }
 
 function addMark(): void {
-  if (!project.value) return
+  if (!currentVersion.value) return
   const mark: RehearsalMark = {
     id: crypto.randomUUID(),
     measureIndex: selectedMeasureIndex.value,
@@ -371,15 +501,15 @@ function addMark(): void {
     color: '#f4b942',
     createdAt: new Date().toISOString(),
   }
-  project.value.marks.push(mark)
+  currentVersion.value.marks.push(mark)
   markLabel.value = ''
   markComment.value = ''
   void saveCurrentProject()
 }
 
 function removeMark(id: string): void {
-  if (!project.value) return
-  project.value.marks = project.value.marks.filter((mark) => mark.id !== id)
+  if (!currentVersion.value) return
+  currentVersion.value.marks = currentVersion.value.marks.filter((mark) => mark.id !== id)
   void saveCurrentProject()
 }
 
